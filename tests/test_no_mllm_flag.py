@@ -262,14 +262,21 @@ def test_load_model_alias_resolver_handles_every_import_shape():
         "rel-direct": "from .server import load_model\nload_model('q')\n",
         "rel-aliased": "from .server import load_model as lm\nlm('q')\n",
         "rel-from-module": "from . import server\nserver.load_model('q')\n",
+        # DeepSeek round-3 #3: ``import vllm_mlx`` followed by
+        # ``vllm_mlx.server.load_model(...)``. The receiver is an
+        # Attribute(value=Name("vllm_mlx"), attr="server") — needs the
+        # new pkg_aliases bucket.
+        "import-pkg": "import vllm_mlx\nvllm_mlx.server.load_model('q')\n",
+        "import-pkg-aliased": "import vllm_mlx as vm\nvm.server.load_model('q')\n",
     }
     for shape, source in shapes.items():
         tree = ast.parse(source)
-        direct, module = _load_model_aliases_in_tree(tree)
+        direct, module, pkg = _load_model_aliases_in_tree(tree)
         hits = [
             n
             for n in ast.walk(tree)
-            if isinstance(n, ast.Call) and _call_targets_load_model(n, direct, module)
+            if isinstance(n, ast.Call)
+            and _call_targets_load_model(n, direct, module, pkg)
         ]
         assert len(hits) == 1, (
             f"alias shape `{shape}` must produce exactly one resolved "
@@ -279,18 +286,62 @@ def test_load_model_alias_resolver_handles_every_import_shape():
     # Negative controls: foreign load_model + unimported load_model.
     foreign = "from mlx_lm.utils import load_model\nload_model('foreign')\n"
     tree = ast.parse(foreign)
-    direct, module = _load_model_aliases_in_tree(tree)
-    assert not direct and not module, (
+    direct, module, pkg = _load_model_aliases_in_tree(tree)
+    assert not direct and not module and not pkg, (
         "mlx_lm.utils.load_model MUST NOT register as our alias — "
         "would false-positive the entrypoint parity gate."
     )
 
     bare = "load_model('q')\n"
     tree = ast.parse(bare)
-    direct, module = _load_model_aliases_in_tree(tree)
-    assert not direct and not module, (
+    direct, module, pkg = _load_model_aliases_in_tree(tree)
+    assert not direct and not module and not pkg, (
         "load_model without an import is NOT our entrypoint."
     )
+
+
+def test_no_star_imports_from_vllm_mlx_server():
+    """DeepSeek round-3 #2 (PR #409): ``from vllm_mlx.server import *``
+    hides the ``load_model`` binding from the SOP §10 alias resolver —
+    ``__all__`` isn't statically discoverable from source alone, so any
+    star import defeats the forwarding audit. Ban it loudly at gate
+    time so contributors spell their imports explicitly.
+
+    Scans every .py file under ``vllm_mlx/`` for a star ImportFrom
+    targeting ``vllm_mlx.server`` (absolute or relative form). Found
+    → fail.
+    """
+    offenders: list[str] = []
+    pkg_root = _pkg_root()
+    for path in pkg_root.rglob("*.py"):
+        parent_parts = path.parent.parts[len(pkg_root.parts) :]
+        if any(part.startswith("__") for part in parent_parts):
+            continue
+        rel = path.relative_to(pkg_root).as_posix()
+        try:
+            source = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        try:
+            tree = ast.parse(source)
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom):
+                continue
+            absolute_server = node.level == 0 and node.module == "vllm_mlx.server"
+            relative_server = node.level >= 1 and node.module == "server"
+            if (absolute_server or relative_server) and any(
+                a.name == "*" for a in node.names
+            ):
+                offenders.append(
+                    f"{rel}:{node.lineno} uses `from vllm_mlx.server "
+                    "import *` (or its relative form). Star imports "
+                    "defeat the load_model alias resolver — spell the "
+                    "imports out so the forwarding audit can verify "
+                    "each routing kwarg (DeepSeek round-3 #2)."
+                )
+    assert not offenders, "\n".join(offenders)
 
 
 def test_force_text_is_keyword_only_in_load_model():
@@ -655,8 +706,8 @@ _KNOWN_ENTRYPOINTS_SEED: frozenset[str] = frozenset(
 # whack-a-mole.
 def _load_model_aliases_in_tree(
     tree: ast.AST,
-) -> tuple[frozenset[str], frozenset[str]]:
-    """Return ``(direct_aliases, module_aliases)``:
+) -> tuple[frozenset[str], frozenset[str], frozenset[str]]:
+    """Return ``(direct_aliases, module_aliases, pkg_aliases)``:
 
     - ``direct_aliases``: local names bound to ``load_model`` (e.g.
       ``"load_model"`` from ``from vllm_mlx.server import load_model``,
@@ -666,9 +717,18 @@ def _load_model_aliases_in_tree(
       ``"srv"`` from ``import vllm_mlx.server as srv``, or the
       two-segment ``"vllm_mlx.server"`` from bare
       ``import vllm_mlx.server``).
+    - ``pkg_aliases``: local names bound to the top-level ``vllm_mlx``
+      package (e.g. ``"vllm_mlx"`` from ``import vllm_mlx`` or
+      ``"vm"`` from ``import vllm_mlx as vm``). Used to recognize
+      ``<pkg_alias>.server.load_model(...)`` call shapes
+      (DeepSeek round-3 #3).
     """
+    # ``pkg_aliases``: top-level package aliases used with
+    # ``<pkg>.server.load_model(...)`` access (DeepSeek round-3 #3).
+    # Tracked here, consulted by ``_call_targets_load_model``.
     direct: set[str] = set()
     module: set[str] = set()
+    pkg_aliases: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
             # ImportFrom shapes that reference vllm_mlx.server:
@@ -704,13 +764,22 @@ def _load_model_aliases_in_tree(
             for alias in node.names:
                 if alias.name == "vllm_mlx.server":
                     module.add(alias.asname or "vllm_mlx.server")
-    return frozenset(direct), frozenset(module)
+                # DeepSeek round-3 fix #3: `import vllm_mlx` lets
+                # callers write `vllm_mlx.server.load_model(...)`. We
+                # track the top-level package alias separately so
+                # `_call_targets_load_model` can reach into the
+                # ``<alias>.server.load_model`` two-level attribute
+                # chain even when only the package was imported.
+                if alias.name == "vllm_mlx":
+                    pkg_aliases.add(alias.asname or "vllm_mlx")
+    return frozenset(direct), frozenset(module), frozenset(pkg_aliases)
 
 
 def _call_targets_load_model(
     call: ast.Call,
     direct_aliases: frozenset[str],
     module_aliases: frozenset[str],
+    pkg_aliases: frozenset[str] = frozenset(),
 ) -> bool:
     """Return True iff ``call`` invokes ``vllm_mlx.server.load_model``
     (under any of the import shapes captured by
@@ -718,9 +787,12 @@ def _call_targets_load_model(
 
       - ``load_model(...)`` / ``lm(...)`` — direct alias name
       - ``server.load_model(...)`` / ``srv.load_model(...)`` —
-        single-level Attribute receiver
+        single-level Attribute receiver against ``module_aliases``
       - ``vllm_mlx.server.load_model(...)`` — two-level Attribute
         receiver collapsed against ``module_aliases``
+      - ``<pkg>.server.load_model(...)`` where ``<pkg>`` is in
+        ``pkg_aliases`` — DeepSeek round-3 #3 fix for the
+        ``import vllm_mlx`` shape.
     """
     func = call.func
     if isinstance(func, ast.Name) and func.id in direct_aliases:
@@ -738,6 +810,15 @@ def _call_targets_load_model(
             receiver_name = "vllm_mlx.server"
         if receiver_name is not None and receiver_name in module_aliases:
             return True
+        # DeepSeek round-3 #3: ``<pkg_alias>.server.load_model(...)``
+        # — receiver is an Attribute(value=Name(pkg_alias), attr="server").
+        if (
+            isinstance(receiver, ast.Attribute)
+            and isinstance(receiver.value, ast.Name)
+            and receiver.attr == "server"
+            and receiver.value.id in pkg_aliases
+        ):
+            return True
     return False
 
 
@@ -754,14 +835,16 @@ def _discover_entrypoints() -> set[str]:
     discovered: set[str] = set()
 
     for path in root.rglob("*.py"):
-        # Skip __pycache__ and other dunder dirs.
-        if any(part.startswith("__") for part in path.parts[len(root.parts) :]):
+        # DeepSeek round-3 fix (PR #409): skip only DIRECTORY parts
+        # starting with ``__`` (e.g. ``__pycache__``). The previous
+        # check walked ``path.parts`` which includes the filename, so
+        # ``__init__.py`` matched the dunder prefix and was skipped —
+        # silently dropping any entrypoint code that lives in an
+        # ``__init__.py``. Now only the directory chain (``parent.parts``)
+        # is checked.
+        parent_parts = path.parent.parts[len(root.parts) :]
+        if any(part.startswith("__") for part in parent_parts):
             continue
-        if path.name == "__init__.py":
-            # __init__ files are usually re-exports; if a real
-            # entrypoint shows up there it's still discovered via the
-            # AST checks below.
-            pass
 
         try:
             source = path.read_text()
@@ -776,7 +859,7 @@ def _discover_entrypoints() -> set[str]:
         # call scan, so a new entrypoint using `from vllm_mlx import
         # server` / `import vllm_mlx.server as srv` doesn't slip
         # discovery.
-        direct_aliases, module_aliases = _load_model_aliases_in_tree(tree)
+        direct_aliases, module_aliases, pkg_aliases = _load_model_aliases_in_tree(tree)
 
         # Codex round-H fix (PR #409): the later prongs in
         # ``test_no_unregistered_routing_shaped_flags`` ban indirect
@@ -812,7 +895,9 @@ def _discover_entrypoints() -> set[str]:
                     ):
                         has_routing_shape = True
                         break
-            elif _call_targets_load_model(node, direct_aliases, module_aliases):
+            elif _call_targets_load_model(
+                node, direct_aliases, module_aliases, pkg_aliases
+            ):
                 # Any caller of OUR load_model (under any alias) is by
                 # definition an entrypoint that needs the forwarding check.
                 has_routing_shape = True
@@ -1426,13 +1511,13 @@ def test_load_model_callers_register_every_routing_flag():
         # qualified). The single helper closes rounds D/E/F/G bypasses
         # at once and means every other scanner in this file picks up
         # the same coverage.
-        direct_aliases, module_aliases = _load_model_aliases_in_tree(tree)
+        direct_aliases, module_aliases, pkg_aliases = _load_model_aliases_in_tree(tree)
         if not (direct_aliases or module_aliases):
             continue
 
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _call_targets_load_model(
-                node, direct_aliases, module_aliases
+                node, direct_aliases, module_aliases, pkg_aliases
             ):
                 load_model_callers.add(rel)
                 break
@@ -1656,13 +1741,13 @@ def test_routing_override_kwargs_are_forwarded_to_load_model():
         # name match let an aliased caller forward one routing kwarg
         # while omitting the rest — gate passed silently.
         tree = ast.parse(source)
-        direct_aliases, module_aliases = _load_model_aliases_in_tree(tree)
+        direct_aliases, module_aliases, pkg_aliases = _load_model_aliases_in_tree(tree)
         if not (direct_aliases or module_aliases):
             return []
         calls = []
         for node in ast.walk(tree):
             if isinstance(node, ast.Call) and _call_targets_load_model(
-                node, direct_aliases, module_aliases
+                node, direct_aliases, module_aliases, pkg_aliases
             ):
                 calls.append(node)
         return calls
