@@ -255,6 +255,13 @@ def test_load_model_alias_resolver_handles_every_import_shape():
         "from-module": ("from vllm_mlx import server\nserver.load_model('q')\n"),
         "import-as": ("import vllm_mlx.server as srv\nsrv.load_model('q')\n"),
         "import-bare": ("import vllm_mlx.server\nvllm_mlx.server.load_model('q')\n"),
+        # Codex round-H regression: relative imports are what cli.py
+        # actually uses today. ast.ImportFrom encodes these as
+        # ``module="server", level=1`` / ``module=None, level=1`` — the
+        # prior absolute-only match silently dropped them.
+        "rel-direct": "from .server import load_model\nload_model('q')\n",
+        "rel-aliased": "from .server import load_model as lm\nlm('q')\n",
+        "rel-from-module": "from . import server\nserver.load_model('q')\n",
     }
     for shape, source in shapes.items():
         tree = ast.parse(source)
@@ -664,11 +671,32 @@ def _load_model_aliases_in_tree(
     module: set[str] = set()
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom):
-            if node.module in ("vllm_mlx.server", "..server", ".server"):
+            # ImportFrom shapes that reference vllm_mlx.server:
+            #   absolute:  from vllm_mlx.server import load_model
+            #              (module="vllm_mlx.server", level=0)
+            #   absolute:  from vllm_mlx import server
+            #              (module="vllm_mlx", level=0)
+            #   relative:  from .server import load_model
+            #              (module="server", level=1)
+            #   relative:  from . import server
+            #              (module=None, level=1)
+            #
+            # Codex round-H fix (PR #409): the prior absolute-only
+            # matching missed cli.py's `from .server import load_model`
+            # and `from . import server`, silently dropping cli.py from
+            # the forwarding-audit gate. Recognize relative forms by
+            # checking ``node.level >= 1`` and matching the residual
+            # module-name suffix.
+            absolute_server = node.level == 0 and node.module == "vllm_mlx.server"
+            relative_server = node.level >= 1 and node.module == "server"
+            absolute_pkg = node.level == 0 and node.module == "vllm_mlx"
+            relative_pkg = node.level >= 1 and node.module is None
+
+            if absolute_server or relative_server:
                 for alias in node.names:
                     if alias.name == "load_model":
                         direct.add(alias.asname or "load_model")
-            elif node.module in ("vllm_mlx", ".."):
+            elif absolute_pkg or relative_pkg:
                 for alias in node.names:
                     if alias.name == "server":
                         module.add(alias.asname or "server")
@@ -750,12 +778,31 @@ def _discover_entrypoints() -> set[str]:
         # discovery.
         direct_aliases, module_aliases = _load_model_aliases_in_tree(tree)
 
+        # Codex round-H fix (PR #409): the later prongs in
+        # ``test_no_unregistered_routing_shaped_flags`` ban indirect
+        # add_argument shapes (``getattr(p, "add_argument")(...)``,
+        # ``**unpack`` kwargs, custom Action subclasses). Those bans
+        # only run on discovered files, so if discovery requires a
+        # direct ``Attribute`` add_argument call, a new entrypoint
+        # using only the indirect shape would skip discovery AND skip
+        # the ban — the very bypass the bans exist to catch.
+        # Broaden discovery: flag any file that mentions the literal
+        # STRING "add_argument" anywhere (catches getattr / __dict__
+        # access / dynamic dispatch). No legitimate code references
+        # that identifier outside argparse contexts.
+        mentions_add_argument_literal = any(
+            isinstance(n, ast.Constant)
+            and isinstance(n.value, str)
+            and n.value == "add_argument"
+            for n in ast.walk(tree)
+        )
+
         has_routing_shape = False
         for node in ast.walk(tree):
             if not isinstance(node, ast.Call):
                 continue
             func = node.func
-            # add_argument detection (unchanged) — argparse method.
+            # add_argument detection (direct form): argparse method.
             if isinstance(func, ast.Attribute) and func.attr == "add_argument":
                 for arg in node.args:
                     if (
@@ -772,6 +819,13 @@ def _discover_entrypoints() -> set[str]:
 
             if has_routing_shape:
                 break
+
+        if not has_routing_shape and mentions_add_argument_literal:
+            # Codex round-H: the file references "add_argument" via
+            # something other than a direct Attribute call — exactly
+            # the indirect shape that the later add_argument-shape
+            # bans want to scan. Force discovery so those bans run.
+            has_routing_shape = True
 
         if has_routing_shape:
             rel = path.relative_to(root).as_posix()
