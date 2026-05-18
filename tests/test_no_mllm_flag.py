@@ -473,6 +473,64 @@ def _add_argument_calls_with_custom_action(source: str) -> list[tuple[int, str]]
     return offenders
 
 
+def _add_argument_calls_with_dict_kwarg_unpack(source: str) -> list[int]:
+    """Find ``add_argument(..., **dict_literal_or_var)`` calls. Round-5
+    subagent 1 #P2-3: dest aliasing via ``**{"dest": "force_mllm"}`` is
+    invisible to the per-kwarg scan because the keyword arg has
+    ``kw.arg is None``. Reject the unpack outright in entrypoint files
+    — there's no legitimate use of ``**`` for add_argument, and helper
+    dicts hide audit surface."""
+    tree = ast.parse(source)
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        if not (isinstance(func, ast.Attribute) and func.attr == "add_argument"):
+            continue
+        for kw in node.keywords:
+            if kw.arg is None:
+                offenders.append(node.lineno)
+                break
+    return offenders
+
+
+def _getattr_add_argument_calls(source: str) -> list[int]:
+    """Find ``getattr(p, "add_argument")(...)`` and string-concat
+    variants. Round-5 subagent 1 #P2-5: a ``getattr`` indirection
+    defeats the ``isinstance(func, ast.Attribute) and func.attr ==
+    "add_argument"`` predicate at the heart of every prong. There's no
+    legitimate use case in argparse code, so we ban the shape outright."""
+    tree = ast.parse(source)
+    offenders: list[int] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        # Outer Call has Call as func (the result of getattr being called).
+        if not isinstance(node.func, ast.Call):
+            continue
+        inner = node.func
+        if not (isinstance(inner.func, ast.Name) and inner.func.id == "getattr"):
+            continue
+        if len(inner.args) < 2:
+            continue
+        name_arg = inner.args[1]
+        # Constant "add_argument" or string concat resolving to it.
+        if isinstance(name_arg, ast.Constant) and name_arg.value == "add_argument":
+            offenders.append(node.lineno)
+            continue
+        # String concat shape: "add_" + "argument".
+        try:
+            value = ast.literal_eval(name_arg)
+            if isinstance(value, str) and value == "add_argument":
+                offenders.append(node.lineno)
+        except (ValueError, TypeError):
+            # Non-literal — also suspicious (could resolve to add_argument
+            # at runtime). Flag the dynamic indirection.
+            offenders.append(node.lineno)
+    return offenders
+
+
 def _add_argument_calls_with_non_literal_flag(source: str) -> list[int]:
     """Find ``add_argument(<non-Constant>, ...)`` calls where the first
     positional argument is a variable, attribute, function call, or
@@ -766,6 +824,16 @@ def test_registry_is_not_runtime_mutated():
                 and elt.func.id == "RoutingFlagPair"
             ):
                 continue
+            # Round-5 subagent 3 #E: RoutingFlagPair(*list) positional /
+            # starred args bypass the kwargs check. Require every field
+            # to be passed by keyword name so the source AST can verify.
+            if elt.args:
+                pytest.fail(
+                    "RoutingFlagPair() call uses positional / starred args. "
+                    "Every field must be passed by keyword name so the "
+                    "source-AST scan can reconstruct it (round-5 subagent 3 "
+                    "#E bypass)."
+                )
             fields: dict[str, object] = {}
             for kw in elt.keywords:
                 if kw.arg is None:
@@ -926,6 +994,22 @@ def test_conftests_do_not_deselect_or_replace_collection():
                             "assigns to items[...] — rewrites collection list "
                             "(round-4 cat-5 #6 attack pattern). Use markers "
                             "to skip tests instead."
+                        )
+            # Round-5 subagent 3 #H: `del items[i]` / `del items[:]`
+            # achieves the same deselection as items.remove() but via
+            # ast.Delete. Match Delete-of-Subscript on items.
+            if isinstance(node, ast.Delete):
+                for target in node.targets:
+                    if (
+                        isinstance(target, ast.Subscript)
+                        and isinstance(target.value, ast.Name)
+                        and target.value.id == "items"
+                    ):
+                        offenders.append(
+                            f"{conftest.relative_to(repo_root)}:{node.lineno} "
+                            "uses `del items[...]` — drops tests from "
+                            "collection (round-5 subagent 3 #H bypass). Use "
+                            "item.add_marker(pytest.mark.skip(...)) instead."
                         )
 
     assert not offenders, "\n".join(offenders)
@@ -1108,6 +1192,27 @@ def test_no_unregistered_routing_shaped_flags():
                 "literals so the SOP gate can audit them. Helper functions "
                 "that wrap add_argument() defeat AST scanning (round-4 cat-2 "
                 "#3). Spell out the add_argument call site directly."
+            )
+
+        # Prong 6: add_argument(..., **dict-unpack) — round-5 subagent 1
+        # #P2-3 (dest aliasing via unpacked dict literal). Reject the
+        # ** shape outright in entrypoint files.
+        for lineno in _add_argument_calls_with_dict_kwarg_unpack(source):
+            failures.append(
+                f"{relpath}:{lineno} calls add_argument() with **dict-unpack. "
+                "Spell out every kwarg explicitly so the SOP gate can audit "
+                "dest=/action=/etc (round-5 subagent 1 #P2-3 bypass)."
+            )
+
+        # Prong 7: getattr(p, "add_argument")(...) — round-5 subagent 1
+        # #P2-5 (Attribute-access indirection). No legitimate use of
+        # getattr on a parser for add_argument; ban the shape.
+        for lineno in _getattr_add_argument_calls(source):
+            failures.append(
+                f"{relpath}:{lineno} uses getattr(...)('add_argument')(...) "
+                "indirection — defeats every AST predicate that matches "
+                "Attribute(attr='add_argument'). Use p.add_argument(...) "
+                "directly (round-5 subagent 1 #P2-5 bypass)."
             )
 
     registered = _registered_flag_names()

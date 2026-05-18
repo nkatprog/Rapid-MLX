@@ -107,13 +107,25 @@ NON_ROUTING_PYDANTIC_FIELDS_ALLOWLIST: frozenset[str] = frozenset(
 )
 
 
-ENV_VAR_ROUTING_PATTERN = re.compile(r"^RAPID_MLX_(?:FORCE|NO|ENABLE|DISABLE)_[A-Z_]+$")
+ENV_VAR_ROUTING_PATTERN = re.compile(
+    # Round-5 subagent 3 broadened — drop RAPID_ prefix requirement so
+    # MLX_FORCE_*/NO_*/ENABLE_*/DISABLE_* are caught regardless of
+    # whether the contributor remembered the RAPID_ namespace.
+    r"^(?:RAPID_)?MLX_(?:FORCE|NO|ENABLE|DISABLE)_[A-Z_]+$"
+)
 
 
 PYDANTIC_FIELD_ROUTING_PATTERN = re.compile(r"^(force_|no_|enable_|disable_)")
 
 
-SETTER_METHOD_ROUTING_PATTERN = re.compile(r"^set_(?:force_|no_|enable_|disable_|is_)")
+SETTER_METHOD_ROUTING_PATTERN = re.compile(
+    # Round-5 subagent 2 broadened: also catch set_*mllm*, set_*hybrid*,
+    # set_*routing*, set_*moe*, set_*dflash*, set_*multimodal*, plus
+    # configure_*routing* — these all describe runtime routing flips
+    # without using the strict force_/no_ prefix.
+    r"^(?:set|configure)_(?:force_|no_|enable_|disable_|is_)"
+    r"|^(?:set|configure)_.*(?:mllm|hybrid|routing|moe|dflash|multimodal|spec_decode)"
+)
 
 
 def _pkg_root() -> pathlib.Path:
@@ -139,23 +151,163 @@ def _iter_module_files() -> list[pathlib.Path]:
     return out
 
 
-def _find_enclosing_function(
-    tree: ast.AST, target: ast.AST
-) -> ast.FunctionDef | ast.AsyncFunctionDef | None:
-    """Return the innermost function that contains ``target`` in
-    ``tree``, or ``None`` if ``target`` is at module level. Uses a
-    parent walk built from the tree."""
+def _build_parent_map(tree: ast.AST) -> dict[int, ast.AST]:
     parents: dict[int, ast.AST] = {}
     for parent in ast.walk(tree):
         for child in ast.iter_child_nodes(parent):
             parents[id(child)] = parent
+    return parents
 
+
+def _enclosing_function_chain(
+    parents: dict[int, ast.AST], target: ast.AST
+) -> list[ast.FunctionDef | ast.AsyncFunctionDef]:
+    """Return EVERY enclosing function from innermost to outermost.
+
+    Round-5 hardening (subagent 2 bypass): a nested function NAMED
+    ``__init__`` inside a real (non-allowed) method would pass the
+    innermost-only check because the immediate enclosing function name
+    matches the allowlist. By returning the full chain we let the
+    caller require EVERY ancestor function to be allowlisted — a
+    fake-nested-init slips past the innermost check but is caught
+    when we see the outer real handler isn't allowed.
+    """
+    chain: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
     cur: ast.AST | None = parents.get(id(target))
     while cur is not None:
         if isinstance(cur, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            return cur
+            chain.append(cur)
         cur = parents.get(id(cur))
-    return None
+    return chain
+
+
+def _routing_attr_write_targets(node: ast.AST) -> list[tuple[str, ast.AST]]:
+    """Return ``(attr_name, source_node)`` pairs for every routing-attr
+    write expressed by ``node``. Covers many indirect attribute-write
+    forms beyond ``Attribute`` assignment:
+
+      - ``self.x = ...`` (Assign target = Attribute)
+      - ``self.x: int = ...`` (AnnAssign with Attribute target)
+      - ``self.x |= ...`` (AugAssign with Attribute target)
+      - ``setattr(self, "x", ...)`` (round-5 subagent 5 #1)
+      - ``object.__setattr__(self, "x", ...)`` (#3)
+      - ``type(self).__setattr__(self, "x", ...)`` (#4)
+      - ``self.__dict__["x"] = ...`` (#5/6)
+      - ``vars(self)["x"] = ...`` (#5/7)
+      - ``del self.x`` / ``del vars(self)["x"]`` (also a routing mutation)
+
+    Round-5 subagent 5 demonstrated 11/14 setattr-style bypasses on the
+    previous Attribute-only scanner. This helper unifies all the shapes
+    so the gate doesn't drift.
+    """
+    pairs: list[tuple[str, ast.AST]] = []
+
+    # 1. Direct Attribute assignment / augassign / annassign.
+    attr_targets: list[ast.Attribute] = []
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            if isinstance(t, ast.Attribute):
+                attr_targets.append(t)
+    elif (
+        isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Attribute)
+    ) or (isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Attribute)):
+        attr_targets.append(node.target)
+    for tgt in attr_targets:
+        pairs.append((tgt.attr, node))
+
+    # 2. Subscript assignment to .__dict__["x"] or vars(obj)["x"].
+    subscript_targets: list[ast.Subscript] = []
+    if isinstance(node, ast.Assign):
+        for t in node.targets:
+            if isinstance(t, ast.Subscript):
+                subscript_targets.append(t)
+    elif isinstance(node, ast.AugAssign) and isinstance(node.target, ast.Subscript):
+        subscript_targets.append(node.target)
+
+    # ast.Delete: `del self.x` / `del vars(self)["x"]` — these clear a
+    # routing decision the same way an assignment of False would.
+    if isinstance(node, ast.Delete):
+        for tgt in node.targets:
+            if isinstance(tgt, ast.Attribute):
+                pairs.append((tgt.attr, node))
+            elif isinstance(tgt, ast.Subscript):
+                subscript_targets.append(tgt)
+
+    for sub in subscript_targets:
+        # ``self.__dict__["x"] = ...`` — value is Attribute(attr="__dict__")
+        if (isinstance(sub.value, ast.Attribute) and sub.value.attr == "__dict__") or (
+            isinstance(sub.value, ast.Call)
+            and isinstance(sub.value.func, ast.Name)
+            and sub.value.func.id == "vars"
+        ):
+            key = sub.slice
+            if isinstance(key, ast.Constant) and isinstance(key.value, str):
+                pairs.append((key.value, node))
+
+    # 3. Call-form setattr / __setattr__ — second arg is the attr name.
+    if isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+        call = node.value
+    elif isinstance(node, ast.Call):
+        call = node
+    else:
+        call = None
+    # Also handle setattr as statement target (e.g. inside `if x: setattr(...)`).
+    # Walking standalone Call nodes inside the broader scanner picks them up,
+    # but for ``x := setattr(...)`` / list-comprehension wrappers the call is
+    # in an arbitrary expression context — those are scanned elsewhere too.
+    if call is not None:
+        func = call.func
+        if (
+            isinstance(func, ast.Name) and func.id == "setattr" and len(call.args) >= 2
+        ) or (
+            isinstance(func, ast.Attribute)
+            and func.attr == "__setattr__"
+            and len(call.args) >= 2
+        ):
+            name_arg = call.args[1]
+            if isinstance(name_arg, ast.Constant) and isinstance(name_arg.value, str):
+                pairs.append((name_arg.value, node))
+
+    return pairs
+
+
+def _all_routing_write_calls(tree: ast.AST) -> list[tuple[str, ast.AST]]:
+    """Walk every node in ``tree`` and return all
+    ``(routing_attr, node)`` writes. Distinct from
+    ``_routing_attr_write_targets`` (which is per-node) so the gate
+    can also catch setattr() / __dict__[] writes that aren't the
+    top-level statement node (e.g. inside walrus, comprehension)."""
+    out: list[tuple[str, ast.AST]] = []
+    for node in ast.walk(tree):
+        out.extend(_routing_attr_write_targets(node))
+        # Standalone call inside any expression context — setattr()
+        # via walrus or as a comprehension element.
+        if isinstance(node, ast.Call):
+            func = node.func
+            if (
+                isinstance(func, ast.Name)
+                and func.id == "setattr"
+                and len(node.args) >= 2
+            ) or (
+                isinstance(func, ast.Attribute)
+                and func.attr == "__setattr__"
+                and len(node.args) >= 2
+            ):
+                name_arg = node.args[1]
+                if isinstance(name_arg, ast.Constant) and isinstance(
+                    name_arg.value, str
+                ):
+                    out.append((name_arg.value, node))
+    # Dedupe — Expr(Call(...)) and the inner Call both produce the same hit.
+    seen: set[tuple[int, str]] = set()
+    deduped: list[tuple[str, ast.AST]] = []
+    for attr, n in out:
+        key = (id(n), attr)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append((attr, n))
+    return deduped
 
 
 def test_routing_fields_written_only_in_allowed_scopes():
@@ -193,45 +345,39 @@ def test_routing_fields_written_only_in_allowed_scopes():
         except SyntaxError:
             continue
 
-        for node in ast.walk(tree):
-            # Match ``Assign`` to ``Attribute`` and ``AugAssign`` to
-            # ``Attribute`` (e.g. ``self.x |= ...``).
-            attr_targets: list[ast.Attribute] = []
-            if isinstance(node, ast.Assign):
-                for t in node.targets:
-                    if isinstance(t, ast.Attribute):
-                        attr_targets.append(t)
-            elif (
-                isinstance(node, ast.AugAssign)
-                and isinstance(node.target, ast.Attribute)
-                or isinstance(node, ast.AnnAssign)
-                and isinstance(node.target, ast.Attribute)
-            ):
-                attr_targets.append(node.target)
-
-            for tgt in attr_targets:
-                if tgt.attr not in ROUTING_ATTRS:
-                    continue
-                enclosing = _find_enclosing_function(tree, node)
-                if enclosing is None:
-                    # Module-level write — always forbidden for routing fields.
-                    offenders.append(
-                        f"{rel}:{node.lineno} module-level write to routing "
-                        f"attribute `.{tgt.attr}` — not inside any function, "
-                        "no review surface. Routing decisions must live in "
-                        "AUTO_ROUTING_FLAG_PAIRS and be set by EngineCore.__init__."
-                    )
-                    continue
-                if enclosing.name in ROUTING_WRITE_ALLOWED_FUNCS:
-                    continue
+        parents = _build_parent_map(tree)
+        for attr_name, node in _all_routing_write_calls(tree):
+            if attr_name not in ROUTING_ATTRS:
+                continue
+            chain = _enclosing_function_chain(parents, node)
+            if not chain:
+                offenders.append(
+                    f"{rel}:{node.lineno} module-level write to routing "
+                    f"attribute `.{attr_name}` — not inside any function, "
+                    "no review surface. Routing decisions must live in "
+                    "AUTO_ROUTING_FLAG_PAIRS and be set by EngineCore.__init__."
+                )
+                continue
+            # Round-5 hardening: require EVERY ancestor function to be
+            # allowlisted, not just the innermost. A real handler
+            # `chat_completion` containing a nested `def __init__(): ...`
+            # would pass the old innermost-only check; the all-ancestors
+            # check catches it because `chat_completion` is not allowed.
+            disallowed = [
+                fn.name for fn in chain if fn.name not in ROUTING_WRITE_ALLOWED_FUNCS
+            ]
+            if disallowed:
                 offenders.append(
                     f"{rel}:{node.lineno} writes routing attribute "
-                    f"`.{tgt.attr}` inside function `{enclosing.name}` — "
-                    f"only {sorted(ROUTING_WRITE_ALLOWED_FUNCS)} may write "
-                    "routing fields (round-4 cat-3 per-request bypass). "
-                    "If you need a new routing decision, add a "
-                    "RoutingFlagPair entry in test_no_mllm_flag.py and "
-                    "wire it through EngineCore.__init__."
+                    f"`.{attr_name}` inside function chain "
+                    f"{[fn.name for fn in chain][::-1]} — function(s) "
+                    f"{disallowed} not in "
+                    f"{sorted(ROUTING_WRITE_ALLOWED_FUNCS)}. Round-5 subagent "
+                    "found nested-fn-named-__init__ inside non-allowed methods "
+                    "slips innermost-only checks; this gate now requires every "
+                    "ancestor to be allowlisted. Detected shapes include "
+                    "Assign, AnnAssign, AugAssign, Subscript (vars/__dict__), "
+                    "setattr(), object.__setattr__(), and ast.Delete."
                 )
 
     assert not offenders, "\n".join(offenders)
@@ -269,32 +415,67 @@ def test_no_routing_shaped_rapid_mlx_env_vars():
             continue
 
         for node in ast.walk(tree):
+            # Round-5 subagent 3 #B: bytes literal env vars
+            # (os.environb[b"RAPID_MLX_FORCE_MLLM"]) — decode and check
+            # the same pattern.
+            if isinstance(node, ast.Constant) and isinstance(node.value, bytes):
+                try:
+                    value = node.value.decode("ascii")
+                except UnicodeDecodeError:
+                    continue
+                _check_env_constant(value, rel, node.lineno, offenders)
+                continue
             if not isinstance(node, ast.Constant):
                 continue
             if not isinstance(node.value, str):
                 continue
-            value = node.value
-            if not value.startswith("RAPID_MLX_"):
-                continue
-            if value in ALLOWED_RAPID_MLX_ENV_VARS:
-                continue
-            if ENV_VAR_ROUTING_PATTERN.match(value):
+            _check_env_constant(node.value, rel, node.lineno, offenders)
+
+        # Round-5 subagent 3 #B: ban os.environb references entirely.
+        # No legitimate use, bytes-form env reads are a parallel surface.
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, ast.Attribute)
+                and node.attr == "environb"
+                and isinstance(node.value, ast.Name)
+                and node.value.id == "os"
+            ):
                 offenders.append(
-                    f"{rel}:{node.lineno} references env var `{value}` — "
-                    "matches the routing-shape pattern "
-                    "RAPID_MLX_(FORCE|NO|ENABLE|DISABLE)_*. Routing decisions "
-                    "must go through CLI flags, not env vars (round-4 cat-4 "
-                    "bypass). Register a RoutingFlagPair instead."
-                )
-            else:
-                offenders.append(
-                    f"{rel}:{node.lineno} references env var `{value}` — "
-                    "not in ALLOWED_RAPID_MLX_ENV_VARS. If this is a non-"
-                    "routing knob, add it to the allowlist with a comment. "
-                    "Routing env vars are forbidden."
+                    f"{rel}:{node.lineno} uses `os.environb` — bytes-form env "
+                    "var access bypasses the string-Constant scan. Use "
+                    "os.environ.get() with a documented str key instead."
                 )
 
     assert not offenders, "\n".join(offenders)
+
+
+def _check_env_constant(
+    value: str, rel: str, lineno: int, offenders: list[str]
+) -> None:
+    """Run the env-var routing checks against a single constant string."""
+    # Strip RAPID_ prefix for the routing-shape check so both
+    # RAPID_MLX_FORCE_* and MLX_FORCE_* are caught.
+    if not (value.startswith("RAPID_MLX_") or value.startswith("MLX_")):
+        return
+    if value in ALLOWED_RAPID_MLX_ENV_VARS:
+        return
+    if ENV_VAR_ROUTING_PATTERN.match(value):
+        offenders.append(
+            f"{rel}:{lineno} references env var `{value}` — matches the "
+            "routing-shape pattern (RAPID_)?MLX_(FORCE|NO|ENABLE|DISABLE)_*. "
+            "Routing decisions must go through CLI flags, not env vars "
+            "(round-4 cat-4 + round-5 subagent 3 #C). Register a "
+            "RoutingFlagPair instead."
+        )
+    elif value.startswith("RAPID_MLX_"):
+        # Only treat RAPID_MLX_ as our namespace; bare MLX_ may be from
+        # upstream mlx-lm or transformers.
+        offenders.append(
+            f"{rel}:{lineno} references env var `{value}` — not in "
+            "ALLOWED_RAPID_MLX_ENV_VARS. If this is a non-routing knob, "
+            "add it to the allowlist with a comment. Routing env vars "
+            "are forbidden."
+        )
 
 
 def test_no_routing_shaped_pydantic_fields_in_api():
@@ -408,28 +589,19 @@ def test_no_routing_shaped_request_headers():
     header read in middleware, mutating routing per-request. The
     header NAME has to appear as a string constant somewhere.
 
-    Forbid any string constant matching ``X-Rapid-MLX-(Force|No|Enable|
-    Disable)-*`` in ``vllm_mlx/middleware/`` and ``vllm_mlx/routes/``.
-    The Rapid-MLX-prefixed header is our namespace, and the
-    routing-shape inside it has no legitimate use.
+    Round-5 subagent 2 expanded scope: previously the scan was limited
+    to ``middleware/`` and ``routes/``; an attacker writing the same
+    header in ``server.py`` or ``api/`` slipped. Now scans every file
+    under ``vllm_mlx/`` because ``X-Rapid-MLX-`` is OUR namespace and
+    the routing-shape inside it has no legitimate use anywhere.
     """
     pkg_root = _pkg_root()
     header_pattern = re.compile(
         r"^X-Rapid-MLX-(?:Force|No|Enable|Disable)-", re.IGNORECASE
     )
 
-    paths: list[pathlib.Path] = []
-    middleware_dir = pkg_root / "middleware"
-    routes_dir = pkg_root / "routes"
-    if middleware_dir.exists():
-        paths.extend(middleware_dir.rglob("*.py"))
-    if routes_dir.exists():
-        paths.extend(routes_dir.rglob("*.py"))
-
     offenders: list[str] = []
-    for path in paths:
-        if any(part.startswith("__") for part in path.parts):
-            continue
+    for path in _iter_module_files():
         rel = path.relative_to(pkg_root).as_posix()
         try:
             source = path.read_text()
@@ -454,3 +626,53 @@ def test_no_routing_shaped_request_headers():
                 )
 
     assert not offenders, "\n".join(offenders)
+
+
+def test_alias_profile_str_fields_are_explicitly_listed():
+    """Round-5 subagent 3 #D: an attacker adds ``multimodal_mode: str =
+    "auto"`` to ``AliasProfile`` (passes round-4's name-shape check
+    because the name doesn't start with ``force_``/``no_``) and code
+    that branches on the value to flip routing. The previous gate
+    looked only at name shape — string-enum routing fields slip.
+
+    The defense: require an explicit per-field decision for every
+    ``str`` field on ``AliasProfile``. The allowlist below names every
+    legitimate string field with a one-line reason. Adding a new
+    string field requires editing this allowlist AND explaining what
+    the values mean — surfaces the routing-vs-data tradeoff at PR
+    review.
+    """
+    import dataclasses
+
+    from vllm_mlx.model_aliases import AliasProfile
+
+    # Explicit allowlist of AliasProfile string-typed fields. Every
+    # entry needs a 1-line reason describing the field's value space.
+    # Strings whose value space is open-ended (HF paths, parser names)
+    # are not routing decisions; strings whose value space is a small
+    # closed enum are LIKELY routing and should be flagged.
+    ALLOWED_STR_FIELDS: frozenset[str] = frozenset(
+        {
+            "hf_path",  # HF repo path, open-ended URL-like string
+            "tool_call_parser",  # parser key, see PARSER_REGISTRY
+            "reasoning_parser",  # parser key, see PARSER_REGISTRY
+            "suffix_decoding_tier",  # one of VALID_SUFFIX_TIERS — non-routing data
+            "dflash_draft_model",  # HF path for the spec-decode drafter
+        }
+    )
+
+    str_fields = [
+        f.name
+        for f in dataclasses.fields(AliasProfile)
+        if f.type is str or f.type == "str" or f.type == "str | None"
+    ]
+    unlisted = set(str_fields) - ALLOWED_STR_FIELDS
+    assert not unlisted, (
+        f"AliasProfile has unlisted string field(s): {sorted(unlisted)}. "
+        "Every str field on AliasProfile must be in ALLOWED_STR_FIELDS with "
+        "a 1-line reason. Round-5 subagent 3 #D showed that string-enum "
+        "fields (e.g. multimodal_mode: str = 'auto') are silent routing "
+        "escape hatches — name-shape regex misses them, value-space scans "
+        "are unreliable. The fix is closed-set: a new str field requires "
+        "explicit review."
+    )
