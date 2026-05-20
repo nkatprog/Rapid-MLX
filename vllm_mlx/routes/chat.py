@@ -1117,8 +1117,17 @@ async def stream_chat_completion_guided(
                 total_tokens=prompt_tokens + completion_tokens,
             )
         )
+        # ``created`` must be passed explicitly: the SSE prefix-style
+        # chunks above already share ``_sse_created`` (computed once at
+        # the top of the helper). ``ChatCompletionChunk.created`` has
+        # ``default_factory=lambda: int(time.time())``, so a default
+        # instantiation here would stamp a fresh timestamp on the finish
+        # chunk and break the OpenAI streaming-spec invariant that all
+        # chunks in one completion share a single ``created`` value
+        # (DeepSeek pr_validate round 2 finding).
         finish_chunk = ChatCompletionChunk(
             id=response_id,
+            created=_sse_created,
             model=_resolve_model_name(request.model),
             choices=[
                 ChatCompletionChunkChoice(
@@ -1140,6 +1149,7 @@ async def stream_chat_completion_guided(
         if include_usage:
             usage_chunk = ChatCompletionChunk(
                 id=response_id,
+                created=_sse_created,
                 model=_resolve_model_name(request.model),
                 choices=[],
                 usage=Usage(

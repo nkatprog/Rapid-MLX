@@ -271,6 +271,17 @@ def test_streaming_guided_no_duplicate_usage_when_include_usage_true():
         "expected exactly one dedicated usage chunk when include_usage=True"
     )
 
+    # All chunks in one completion stream must share a single ``created``
+    # timestamp per the OpenAI streaming spec. The new helper pre-computes
+    # ``_sse_created`` and passes it explicitly to ChatCompletionChunk —
+    # without that, ``ChatCompletionChunk.created`` would default-factory
+    # to a fresh ``int(time.time())`` per instantiation and break the
+    # invariant (DeepSeek pr_validate round 2 finding).
+    created_values = {e["created"] for e in events if "created" in e}
+    assert len(created_values) == 1, (
+        f"all SSE chunks must share one created timestamp; saw {created_values}"
+    )
+
     # include_usage default-False branch: usage stays on the finish chunk
     # (legacy behavior — bare clients that don't set the flag still get
     # token counts in the final delta).
