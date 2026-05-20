@@ -1095,7 +1095,14 @@ async def stream_chat_completion_guided(
 
         prompt_tokens = getattr(output, "prompt_tokens", 0) or 0
         completion_tokens = getattr(output, "completion_tokens", 0) or 0
-        finish_reason = getattr(output, "finish_reason", None) or "stop"
+        # Pass the engine's finish_reason through directly. Matches the
+        # convention in ``stream_chat_completion`` (line ~925:
+        # ``finish_reason=event.finish_reason``), which never coerces a
+        # falsy value. ``GenerationOutput.finish_reason`` defaults to
+        # "stop" anyway, so the prior ``or "stop"`` was redundant and
+        # would have silently rewritten any legitimately-None value the
+        # engine emits (DeepSeek pr_validate round 3 finding).
+        finish_reason = getattr(output, "finish_reason", None)
 
         # Final chunk with finish_reason. Usage placement:
         #  - When ``stream_options.include_usage`` is True, usage MUST
