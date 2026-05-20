@@ -575,6 +575,19 @@ async def _create_chat_completion_impl(
         json_schema = extract_json_schema_for_guided(response_format)
         if json_schema and hasattr(engine, "supports_guided_generation"):
             use_guided = engine.supports_guided_generation
+            # Belt-and-suspenders: a future custom engine could advertise
+            # ``supports_guided_generation=True`` yet not implement
+            # ``generate_with_schema``. Without this guard the streaming
+            # path would 500 with AttributeError on the first guided
+            # request; the non-stream branch would do the same. Match
+            # the contract surface that ``stream_chat_completion_guided``
+            # and the non-stream guided dispatch actually call.
+            if use_guided and not hasattr(engine, "generate_with_schema"):
+                logger.warning(
+                    "Engine advertises supports_guided_generation=True but "
+                    "is missing generate_with_schema; disabling guided path"
+                )
+                use_guided = False
             if use_guided:
                 logger.info("Using guided generation for JSON schema enforcement")
 
@@ -1078,7 +1091,20 @@ async def stream_chat_completion_guided(
                 "Guided streaming generation failed, falling back to "
                 f"unconstrained streaming: {guided_err}"
             )
-            logger.debug(f"Problematic schema: {json_schema}")
+            # Log only the schema's top-level shape, not the full body —
+            # user-supplied schemas may embed PII (default values),
+            # internal endpoint names, or be megabytes large. Keys +
+            # required-list are enough to disambiguate the failure
+            # without flooding ops logs or exposing payload contents.
+            _schema_keys = (
+                list(json_schema.keys()) if isinstance(json_schema, dict) else None
+            )
+            _required = (
+                json_schema.get("required") if isinstance(json_schema, dict) else None
+            )
+            logger.debug(
+                f"Problematic schema shape: keys={_schema_keys} required={_required}"
+            )
             async for chunk in stream_chat_completion(
                 engine, messages, request, **kwargs
             ):

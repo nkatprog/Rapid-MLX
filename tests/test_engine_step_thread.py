@@ -493,7 +493,11 @@ class TestGuidedGenerationStepThread:
         monkeypatch.setattr(batched_mod, "HAS_GUIDED", True)
 
         # Simulate outlines failure: _run_guided_generation returns None.
-        engine._run_guided_generation = lambda **_: None
+        # Use MagicMock (not a bare lambda) so the test fails loud if the
+        # call site's positional/kwarg signature changes — a bare
+        # ``lambda **_: None`` would silently swallow signature drift and
+        # let a real call-site regression slip through.
+        engine._run_guided_generation = MagicMock(return_value=None)
 
         # Track whether self.chat was invoked (default fallback path).
         chat_calls = {"n": 0}
