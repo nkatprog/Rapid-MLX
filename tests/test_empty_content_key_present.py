@@ -111,18 +111,32 @@ class TestEmptyContentKeyPresent:
 
     def test_tool_call_response_content_may_be_null(self, monkeypatch):
         """OpenAI exemption: when ``tool_calls`` is populated and the model
-        emitted no content tokens, ``content`` is allowed to be ``null``
-        (or omitted via ``exclude_none``). The fix MUST NOT clobber a
-        legitimate tool-call response by forcing ``content: ""``.
+        emitted no content tokens, ``content`` is allowed to be omitted
+        (matches OpenAI's own response shape). The fix MUST NOT clobber a
+        legitimate tool-call response by forcing ``content: ""`` — that
+        would imply the model produced an empty text response IN ADDITION
+        to the tool call, which is a different (and rare) semantic.
 
         Pre-fix behavior already satisfied this (content stayed None →
-        dropped); the test pins it as an invariant so a future refactor
-        moving the default doesn't silently break tool clients."""
+        dropped by ``exclude_none=True``); the test pins it as an invariant
+        so a future refactor moving the default doesn't silently break
+        tool clients."""
         import vllm_mlx.routes.chat as chat_module
+
+        # Sentinel: verify the monkeypatched parser actually fires. The
+        # cfg.tool_parser=None default in _client() is meant for the empty-
+        # text case where no parser config is needed; routes/chat.py:850
+        # calls ``_parse_tool_calls_with_parser`` unconditionally today, so
+        # the patch is exercised — but if a future refactor adds a
+        # ``if cfg.tool_parser is not None`` guard, this counter goes to
+        # zero and the test fails loudly instead of silently passing on the
+        # wrong code path (DeepSeek round-2 finding #1).
+        parse_call_count = {"n": 0}
 
         def _fake_parse(text, request):
             from vllm_mlx.api.models import FunctionCall, ToolCall
 
+            parse_call_count["n"] += 1
             return (
                 "",
                 [
@@ -176,15 +190,22 @@ class TestEmptyContentKeyPresent:
                 },
             )
             assert resp.status_code == 200, resp.text
+            assert parse_call_count["n"] >= 1, (
+                "monkeypatched parser must be invoked; if this fires, the "
+                "production route added a guard that bypasses parsing and "
+                "this whole test is testing the wrong code path."
+            )
             msg = resp.json()["choices"][0]["message"]
             assert msg.get("tool_calls"), "tool_calls must be present"
-            # OpenAI permits content to be null OR omitted when tool_calls is set.
-            # Critical invariant: it MUST NOT be the empty string "" — that
-            # would imply the model produced an empty text response IN ADDITION
-            # to the tool call, which is a different (and rare) semantic.
-            assert msg.get("content") in (None,), (
-                f"tool_call response must keep content as null (or omit it); "
-                f"empty string would be a semantic regression. got: {msg.get('content')!r}"
+            # Pinned invariant: ``content`` is OMITTED entirely (matches OpenAI
+            # response shape — ``exclude_none=True`` drops the None field).
+            # Use ``not in`` rather than ``.get(...) is None`` so a future
+            # change from omitted to explicit ``null`` (or worse, ``""``)
+            # fails the test loudly (DeepSeek round-2 finding #2).
+            assert "content" not in msg, (
+                f"tool_call response must omit content key entirely; "
+                f"explicit null OR empty string would be a regression. "
+                f"got: {msg.get('content')!r}"
             )
         finally:
             reset_config()

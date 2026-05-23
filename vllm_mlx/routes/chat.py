@@ -917,12 +917,21 @@ async def _create_chat_completion_impl(
     # the engine returns no content tokens (e.g. prefix-cache hit that samples
     # EOS first, or a model that emits only reasoning_content). Clients keyed
     # off ``choices[0].message.content`` (LangChain, Vercel AI SDK) crash with
-    # ``KeyError`` / ``AttributeError`` on the missing field. When ``tool_calls``
-    # is populated, ``content`` may legitimately be null (OpenAI spec); only
-    # default to empty when there's no tool_call either. Placed immediately
-    # before the AssistantMessage construction so it sees the definitive
-    # ``tool_calls`` state — guards against a future refactor that mutates
-    # ``tool_calls`` between the parse/cap/validate block above and this point.
+    # ``KeyError`` / ``AttributeError`` on the missing field.
+    #
+    # ONLY ``tool_calls`` is exempt — OpenAI's own response omits ``content``
+    # when ``tool_calls`` is populated. ``reasoning_content`` is intentionally
+    # NOT an exemption: OpenAI's o1/o3 reasoning models always emit
+    # ``content`` (often empty string) alongside reasoning, and the user-
+    # facing bug we're fixing here was specifically reasoning-only responses
+    # dropping the key. Adding a ``not reasoning_content`` guard would
+    # re-introduce the crash for reasoning models.
+    #
+    # Placed immediately before the AssistantMessage construction so it sees
+    # the definitive ``tool_calls`` state — guards against a future refactor
+    # that mutates ``tool_calls`` between the parse/cap/validate block above
+    # and this point.
+    #
     # NOTE: the streaming path (``stream_chat_completion`` below) intentionally
     # does NOT apply this default — OpenAI's SSE spec has clients accumulate
     # ``content`` from per-delta chunks; the role chunk itself has no content
