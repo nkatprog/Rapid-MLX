@@ -961,10 +961,27 @@ async def _create_chat_completion_impl(
     # ``"content" in msg`` (to distinguish null vs missing) see the same
     # shape they see from api.openai.com. The non-tool-call branch above
     # already defaults to ``""`` so this only runs for tool-call responses.
-    response_dict = chat_response.model_dump(exclude_none=True)
-    for _choice in response_dict.get("choices", ()):
+    #
+    # ``mode="json"`` runs Pydantic's JSON-safe encoder chain (datetimes,
+    # UUIDs, Decimals, any registered @field_serializer) so the subsequent
+    # ``json.dumps`` doesn't trip TypeError on a future field that adds a
+    # non-primitive type — equivalent to what ``model_dump_json`` does but
+    # leaves a dict we can post-process. DeepSeek round-4 finding #1.
+    response_dict = chat_response.model_dump(mode="json", exclude_none=True)
+    # ``or ()`` defends against a future refactor where ``choices`` is
+    # present as ``None`` (rather than absent) — ``get(..., ())`` would
+    # return ``None`` and crash the for-loop. DeepSeek round-4 finding #3.
+    for _choice in response_dict.get("choices") or ():
         _msg = _choice.get("message")
-        if isinstance(_msg, dict) and "content" not in _msg:
+        # Pydantic ``model_dump`` always yields a dict for nested models;
+        # if a future version changes this contract, fail loudly rather
+        # than silently skip the null-injection (which would revert to
+        # the dropped-key bug). DeepSeek round-4 finding #2.
+        assert isinstance(_msg, dict), (
+            f"expected dict from model_dump for choices[].message, "
+            f"got {type(_msg).__name__}"
+        )
+        if "content" not in _msg:
             _msg["content"] = None
     return Response(
         content=json.dumps(response_dict, ensure_ascii=False),
