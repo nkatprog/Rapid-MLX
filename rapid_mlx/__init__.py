@@ -5,12 +5,17 @@ with Apple's MLX framework, focusing on speed, memory efficiency, and ease of us
 
 Personal fork notes:
 - Using this for experimenting with local LLM inference on my M2 MacBook Pro
+- Added memory_profiling_enabled flag to control profiling overhead at import time
 - See README for upstream project: https://github.com/raullenchai/Rapid-MLX
 """
 
 __version__ = "0.1.0"
 __author__ = "Rapid-MLX Contributors"
 __license__ = "MIT"
+
+# Personal preference: disable memory profiling by default to reduce overhead
+# during iterative experimentation; enable explicitly when needed
+memory_profiling_enabled = False
 
 from rapid_mlx.core import RapidModel
 from rapid_mlx.pipeline import InferencePipeline
@@ -21,5 +26,6 @@ __all__ = [
     "InferencePipeline",
     "benchmark",
     "profile_memory",
+    "memory_profiling_enabled",
     "__version__",
 ]
